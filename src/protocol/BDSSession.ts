@@ -1,0 +1,942 @@
+/**
+ * Full BDS 1.26.52.3 session: login → packs → start_game → spawn → input loop
+ */
+
+import { EventEmitter } from "events";
+import type { NetherNetTransport } from "../transport/nethernet";
+import { ProtocolClient } from "./ProtocolClient";
+import { PacketId, ProtocolVersion } from "./packets";
+import type { AuthResult } from "../auth/XboxAuth";
+import type { World } from "../world/World";
+import type { Vec3 } from "../types";
+import {
+  encodeInventoryTransaction,
+  buildAttackEntityPacket,
+  buildUseItemPacket,
+  buildReleaseItemPacket,
+  InventoryTransactionType,
+  type ItemStack,
+} from "./inventory_tx";
+import { encodeGamePacket } from "./codec";
+import { applyLevelChunkToWorld, type DecodedLevelChunk } from "../world/levelChunk";
+import {
+  flagsFromControls,
+  moveVectorFromControls,
+  InputMode,
+  PlayMode,
+  InteractionModel,
+  type MovementControls,
+} from "./authInput";
+import { CompressionAlgorithm } from "./framing";
+import type { Inventory } from "../inventory/Inventory";
+import { ContainerId, type NetworkItem } from "./itemStack";
+import {
+  buildColumnRequest,
+  applySubChunkPacketToWorld,
+  type SubChunkBody,
+} from "./subchunk";
+import { applyStartGameData } from "../registry/applyStartGame";
+import { encodeItemStackRequest, buildTransferRequest } from "./itemStackRequest";
+import { RecipeRegistry } from "../recipe/Recipe";
+
+export interface BDSSessionOptions {
+  transport: NetherNetTransport;
+  username: string;
+  offline: boolean;
+  auth: AuthResult | null;
+  viewDistance?: number;
+  world: World;
+  inventory?: Inventory;
+}
+
+export class BDSSession extends EventEmitter {
+  private client: ProtocolClient;
+  private opts: BDSSessionOptions;
+  private entityId = 1;
+  private runtimeEntityId = 1;
+  private tick = 0;
+  private inputTimer: ReturnType<typeof setInterval> | null = null;
+  private spawned = false;
+  private health = 20;
+  private hotbarSlot = 0;
+  private inventory: Map<number, { networkId: number; count: number }> = new Map();
+  private position: Vec3 = { x: 0, y: 65, z: 0 };
+  private yaw = 0;
+  private pitch = 0;
+  private lastPosition: Vec3 = { x: 0, y: 65, z: 0 };
+  private moveVecX = 0;
+  private moveVecZ = 0;
+  private inputFlags = 0n;
+  private compressionReady = false;
+  private controls: MovementControls = {};
+  private prevControls: MovementControls = {};
+  private publisher = { x: 0, y: 64, z: 0, radius: 8 };
+  private requestedColumns = new Set<string>();
+  /** Columns waiting for SubChunk response — retried once after timeout */
+  private pendingSubChunks = new Map<string, { cx: number; cz: number; dimension: number; highest?: number; at: number }>();
+  private subChunkRetryTimer: ReturnType<typeof setInterval> | null = null;
+  private onGround = true;
+  private correctionHoldUntil = 0;
+  private allowMoveAt = 0;
+  private inputReady = false;
+  /** Last server position whose Y is inside the world. Never follows the void. */
+  private serverAnchor: Vec3 = { x: 0.5, y: 80, z: 0.5 };
+  private anchorValid = false;
+  private lastRespawnAt = 0;
+  private lastVoidLog = 0;
+
+  constructor(opts: BDSSessionOptions) {
+    super();
+    this.opts = opts;
+    this.client = new ProtocolClient(opts.transport);
+    this.wireHandlers();
+    opts.transport.on("disconnected", () => {
+      this.spawned = false;
+      this.inputReady = false;
+      this.stopInputLoop();
+    });
+  }
+
+  get protocol() { return this.client; }
+  get isSpawned() { return this.spawned; }
+  get pos() { return { ...this.position }; }
+  get grounded() { return this.onGround; }
+  get readyForPlay() {
+    // ProtocolClient misses the transport "connected" event if it fired early.
+    // Packets already flowing means the link is up.
+    if (this.opts.transport.isConnected) this.client.connected = true;
+    return this.spawned && this.inputReady && (this.client.connected || this.opts.transport.isConnected)
+      && Date.now() >= this.allowMoveAt
+      && this.saneY(this.position.y);
+  }
+
+  private saneY(y: number) {
+    return Number.isFinite(y) && y > -60 && y < 360;
+  }
+
+  /** Accept a server position only when it is inside the buildable world. */
+  private acceptServerPosition(p: { x: number; y: number; z: number }, source: string) {
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) return;
+    if (!this.saneY(p.y)) {
+      this.recoverFromVoid(source);
+      return;
+    }
+    this.position = { x: p.x, y: p.y, z: p.z };
+    this.lastPosition = { ...this.position };
+    this.serverAnchor = { ...this.position };
+    this.anchorValid = true;
+  }
+
+  /**
+   * Stop confirming a void Y. Snap back to the last good anchor (or y=80)
+   * and ask the server to respawn. Safe to call often — respawn is rate-limited.
+   */
+  recoverFromVoid(why = "void") {
+    if (this.anchorValid && this.saneY(this.serverAnchor.y)) {
+      this.position = { ...this.serverAnchor };
+    } else {
+      this.position = {
+        x: Number.isFinite(this.position.x) ? this.position.x : 0,
+        y: 80,
+        z: Number.isFinite(this.position.z) ? this.position.z : 0,
+      };
+    }
+    this.lastPosition = { ...this.position };
+    this.onGround = true;
+    this.moveVecX = 0;
+    this.moveVecZ = 0;
+    this.controls = {};
+    const now = Date.now();
+    if (now - this.lastVoidLog > 5000) {
+      this.lastVoidLog = now;
+      console.log("[BDSSession] recover", why, "->", this.position);
+    }
+    if (now - this.lastRespawnAt < 5000) return;
+    this.lastRespawnAt = now;
+    try {
+      this.client.send(PacketId.PlayerAction, {
+        runtimeEntityId: this.runtimeEntityId,
+        action: 7, // Respawn
+        position: {
+          x: Math.floor(this.position.x),
+          y: Math.floor(this.position.y),
+          z: Math.floor(this.position.z),
+        },
+        face: 0,
+      });
+    } catch { /* transport may be down */ }
+  }
+
+  private wireHandlers() {
+    this.client.onPacket(PacketId.NetworkSettings, (data) => {
+      if (typeof data.compressionThreshold === "number") {
+        const alg = data.compressionAlgorithm === 1
+          ? CompressionAlgorithm.Snappy
+          : CompressionAlgorithm.Deflate;
+        this.client.setCompressionThreshold(data.compressionThreshold, alg);
+        this.compressionReady = true;
+      }
+      console.log("[BDSSession] NetworkSettings", data);
+      this.emit("network_settings", data);
+      // ClientCacheStatus is optional; some BDS builds parse-fail on unexpected pre-login packets.
+      // this.client.send(PacketId.ClientCacheStatus, { enabled: false });
+      this.sendLogin();
+    });
+
+    this.client.onPacket(PacketId.PlayStatus, (data) => {
+      this.emit("play_status", data);
+      if (data.status === 3 || data.statusName === "player_spawn") {
+        this.onPlayerSpawnStatus();
+      }
+    });
+
+    this.client.onPacket(PacketId.ServerToClientHandshake, (data) => {
+      this.emit("server_handshake", data);
+      this.client.send(PacketId.ClientToServerHandshake, {});
+    });
+
+    this.client.onPacket(PacketId.PacketViolationWarning, (data) => {
+      console.log("[BDSSession] PacketViolationWarning", data);
+    });
+
+    this.client.onPacket(PacketId.ResourcePacksInfo, () => {
+      this.client.send(PacketId.ResourcePackClientResponse, {
+        responseStatus: "have_all_packs",
+        resourcePackIds: [],
+      });
+    });
+
+    this.client.onPacket(PacketId.ResourcePackStack, () => {
+      this.client.send(PacketId.ResourcePackClientResponse, {
+        responseStatus: "completed",
+        resourcePackIds: [],
+      });
+    });
+
+    this.client.onPacket(PacketId.StartGame, (data) => {
+      if (data.runtimeEntityId) this.runtimeEntityId = data.runtimeEntityId;
+      if (data.entityId) this.entityId = data.entityId;
+      if (data.spawn) this.acceptServerPosition(data.spawn, "start_game");
+      this.lastPosition = { ...this.position };
+      try { applyStartGameData(data); } catch { /* palette optional */ }
+      this.emit("start_game", data);
+    });
+
+    this.client.onPacket(PacketId.AddEntity, (data) => {
+      this.emit("entity_add", {
+        id: data.runtimeEntityId ?? data.entityRuntimeId ?? data.id,
+        type: data.type ?? data.entityType ?? "unknown",
+        position: data.position ?? data.pos ?? { x: 0, y: 0, z: 0 },
+        yaw: data.yaw ?? 0,
+        pitch: data.pitch ?? 0,
+      });
+    });
+
+    this.client.onPacket(PacketId.AddPlayer, (data) => {
+      this.emit("player_add", {
+        id: data.runtimeEntityId ?? data.id,
+        username: data.username ?? data.name ?? "player",
+        position: data.position ?? { x: 0, y: 0, z: 0 },
+      });
+    });
+
+    this.client.onPacket(PacketId.RemoveEntity, (data) => {
+      this.emit("entity_remove", data.entityRuntimeId ?? data.runtimeEntityId ?? data.id);
+    });
+
+    this.client.onPacket(PacketId.ContainerOpen, (data) => {
+      this.emit("container_open", {
+        windowId: data.windowId,
+        type: data.type ?? data.windowType,
+        position: data.position,
+      });
+    });
+
+    this.client.onPacket(PacketId.ContainerClose, (data) => {
+      this.emit("container_close", data.windowId);
+    });
+
+    this.client.onPacket(PacketId.CraftingData, (data) => {
+      // Register shapeless/shaped recipes if server sent a list
+      const list = data.recipes ?? data.craftingRecipes ?? [];
+      if (Array.isArray(list)) {
+        for (const r of list) {
+          try {
+            if (r.id && r.result) RecipeRegistry.register(r);
+          } catch { /* ignore malformed */ }
+        }
+        this.emit("crafting_data", { count: list.length });
+      }
+    });
+
+    this.client.onPacket(PacketId.LevelChunk, (data) => {
+      if (typeof data.x === "number" && typeof data.z === "number") {
+        if (data.requestMode) {
+          this.requestColumnSubChunks(data.x, data.z, data.dimension ?? 0, data.highestSubChunk);
+        } else {
+          try {
+            applyLevelChunkToWorld(this.opts.world, data as DecodedLevelChunk);
+          } catch {
+            this.opts.world.getOrCreateColumn(data.x, data.z);
+          }
+        }
+        this.emit("chunk", data);
+      }
+    });
+
+    this.client.onPacket(PacketId.SubChunk, (data) => {
+      try {
+        applySubChunkPacketToWorld(this.opts.world, data as SubChunkBody);
+        // Clear pending retry for this column if we can identify origin
+        const body = data as SubChunkBody;
+        if (body?.origin) {
+          const key = `${body.dimension ?? 0}:${body.origin.x}:${body.origin.z}`;
+          this.pendingSubChunks.delete(key);
+        }
+      } catch { /* ignore */ }
+      this.emit("subchunk", data);
+    });
+
+    this.client.onPacket(PacketId.NetworkChunkPublisherUpdate, (data) => {
+      if (data.position) {
+        this.publisher = {
+          x: data.position.x,
+          y: data.position.y,
+          z: data.position.z,
+          radius: data.radius ?? this.publisher.radius,
+        };
+      }
+      this.emit("publisher", data);
+    });
+
+    this.client.onPacket(PacketId.UpdateBlock, (data) => {
+      if (data.position && data.blockRuntimeId != null) {
+        this.opts.world.setBlock(
+          data.position.x,
+          data.position.y,
+          data.position.z,
+          data.blockRuntimeId
+        );
+        this.emit("block_update", data);
+      }
+    });
+
+    this.client.onPacket(PacketId.InventoryContent, (data) => {
+      this.applyInventoryContent(data.windowId, data.items ?? []);
+      this.emit("inventory", data);
+    });
+
+    this.client.onPacket(PacketId.InventorySlot, (data) => {
+      this.applyInventorySlot(data.windowId, data.slot, data.item);
+      this.emit("inventory_slot", data);
+    });
+
+    this.client.onPacket(PacketId.PlayerHotbar, (data) => {
+      this.opts.inventory?.selectHotbar(data.selectedSlot ?? 0);
+      this.emit("hotbar", data);
+    });
+
+    this.client.onPacket(PacketId.Text, (data) => {
+      this.emit("chat", data);
+    });
+
+    this.client.onPacket(PacketId.Disconnect, (data) => {
+      this.stopInputLoop();
+      this.emit("disconnect", data.message ?? "disconnected");
+    });
+
+    this.client.onPacket(PacketId.SetHealth, (data) => {
+      if (typeof data.health === "number") (this as any).health = data.health;
+      console.log("[BDSSession] health=", data.health);
+      this.emit("health", data);
+    });
+
+    
+    this.client.onPacket(PacketId.UpdateAbilities, (data: any) => {
+      let invuln = !!(data?.invulnerable);
+      const layers = data?.abilityLayers ?? data?.layers ?? [];
+      for (const layer of layers) {
+        if (layer?.invulnerable) invuln = true;
+      }
+      (this as any).invulnerable = invuln;
+      console.log("[BDSSession] abilities invuln=", invuln);
+      this.emit("abilities", data);
+    });
+
+    this.client.onPacket(PacketId.SetPlayerGameType, (data: any) => {
+      const gm = data?.gamemode ?? data?.gameType ?? data?.gameMode;
+      if (typeof gm === "number") {
+        (this as any).gamemode = gm;
+        console.log("[BDSSession] gamemode=", gm);
+      }
+      this.emit("gamemode", gm);
+    });
+
+    this.client.onPacket(PacketId.EntityEvent, (data: any) => {
+      this.emit("entity_event", data);
+      const ev = data?.eventId ?? data?.type ?? data?.event;
+      if (ev === 2 || ev === "hurt") {
+        this.emit("hurt", data);
+        console.log("[BDSSession] hurt", data);
+      }
+      if (ev === 3 || ev === "death") {
+        this.emit("death", data);
+        console.log("[BDSSession] death", data);
+      }
+    });
+
+    this.client.onPacket(PacketId.MovePlayer, (data) => {
+      const rid = Number(data.runtimeEntityId ?? 0);
+      if (rid && rid !== this.runtimeEntityId) return;
+      if (data.position) {
+        this.position = { ...data.position };
+        this.lastPosition = { ...this.position };
+      }
+      if (typeof data.pitch === "number") this.pitch = data.pitch;
+      if (typeof data.yaw === "number") this.yaw = data.yaw;
+      this.emit("move", { ...this.position, pitch: this.pitch, yaw: this.yaw });
+    });
+
+    this.client.onPacket(PacketId.CorrectPlayerMovePrediction, (data) => {
+      if (data.position) {
+        this.position = { ...data.position };
+        this.lastPosition = { ...this.position };
+        console.log("[BDSSession] Server corrected position:", this.position);
+      }
+    });
+
+    this.client.on("packet", (id, data) => {
+      this.emit("packet", id, data);
+    });
+  }
+
+  private applyInventoryContent(windowId: number, items: Array<NetworkItem | null>) {
+    const inv = this.opts.inventory;
+    if (!inv) return;
+    if (windowId === ContainerId.Inventory || windowId === 0) {
+      items.forEach((it, slot) => {
+        if (!it) inv.setSlot(slot, null);
+        else inv.setSlot(slot, { networkId: it.networkId, count: it.count, metadata: it.metadata, slot });
+      });
+    }
+  }
+
+  private applyInventorySlot(windowId: number, slot: number, item: NetworkItem | null) {
+    const inv = this.opts.inventory;
+    if (!inv) return;
+    if (windowId === ContainerId.Inventory || windowId === 0) {
+      inv.setSlot(slot, item ? { networkId: item.networkId, count: item.count, metadata: item.metadata, slot } : null);
+    }
+  }
+
+  async startLogin(): Promise<void> {
+    console.log(`[BDSSession] RequestNetworkSettings protocol=${ProtocolVersion}`);
+    this.client.send(PacketId.RequestNetworkSettings, {
+      clientNetworkVersion: ProtocolVersion,
+    });
+
+    setTimeout(() => {
+      if (!this.compressionReady && !this.spawned) {
+        console.log("[BDSSession] No NetworkSettings yet — offline simulated spawn path");
+        this.emit("start_game", {
+          gamemode: 0,
+          dimension: 0,
+          spawn: { x: 0.5, y: 65, z: 0.5 },
+          time: 1000,
+          runtimeEntityId: 1,
+          entityId: 1,
+        });
+        this.position = { x: 0.5, y: 65, z: 0.5 };
+        this.lastPosition = { ...this.position };
+        this.onPlayerSpawnStatus();
+      }
+    }, 2500);
+  }
+
+  private requestColumnSubChunks(cx: number, cz: number, dimension = 0, highest?: number) {
+    const key = `${dimension}:${cx}:${cz}`;
+    if (this.requestedColumns.has(key)) return;
+    this.requestedColumns.add(key);
+    const maxIndex = typeof highest === "number" ? Math.min(19, highest) : 19;
+    const req = buildColumnRequest(cx, cz, { dimension, minIndex: -4, maxIndex });
+    this.client.send(PacketId.SubChunkRequest, req);
+    this.pendingSubChunks.set(key, { cx, cz, dimension, highest, at: Date.now() });
+    this.ensureSubChunkRetryLoop();
+  }
+
+  private ensureSubChunkRetryLoop() {
+    if (this.subChunkRetryTimer) return;
+    this.subChunkRetryTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of this.pendingSubChunks) {
+        if (now - entry.at < 4000) continue;
+        // One retry then drop
+        console.log(`[BDSSession] SubChunk retry for column ${key}`);
+        const maxIndex = typeof entry.highest === "number" ? Math.min(19, entry.highest) : 19;
+        const req = buildColumnRequest(entry.cx, entry.cz, { dimension: entry.dimension, minIndex: -4, maxIndex });
+        this.client.send(PacketId.SubChunkRequest, req);
+        this.pendingSubChunks.delete(key);
+      }
+      if (this.pendingSubChunks.size === 0 && this.subChunkRetryTimer) {
+        clearInterval(this.subChunkRetryTimer);
+        this.subChunkRetryTimer = null;
+      }
+    }, 2000);
+  }
+
+  private sendLogin() {
+    const auth = this.opts.auth as any;
+    console.log(`[BDSSession] Login chain=${auth?.chain?.length ?? 0} user=${this.opts.username} offline=${this.opts.offline} hasKey=${!!auth?.keyPair?.privateKeyPem}`);
+    this.client.send(PacketId.Login, {
+      protocol: ProtocolVersion,
+      username: this.opts.username,
+      offline: this.opts.offline,
+      chain: auth?.chain ?? [],
+      uuid: auth?.uuid,
+      xuid: auth?.xuid,
+      privateKeyPem: auth?.keyPair?.privateKeyPem,
+      identityPublicKey: auth?.keyPair?.x509,
+      x509: auth?.keyPair?.x509,
+      serverAddress: `${(this.opts as any).host ?? ""}:${(this.opts as any).port ?? ""}`,
+      multiplayerToken: auth?.multiplayerToken ?? "",
+          });
+  }
+
+  private onPlayerSpawnStatus() {
+    if (this.spawned) return;
+    this.spawned = true;
+    this.inputReady = false;
+    this.allowMoveAt = Date.now() + 1000;
+    this.lastPosition = { ...this.position };
+    console.log(`[BDSSession] SPAWN init runtimeId=${this.runtimeEntityId} pos=`, this.position);
+    // Request radius
+    setTimeout(() => {
+      try {
+        this.client.send(PacketId.RequestChunkRadius, {
+          chunkRadius: this.opts.viewDistance ?? 8,
+        });
+      } catch {}
+    }, 500);
+    setTimeout(() => {
+      try {
+        this.client.send(PacketId.SetLocalPlayerAsInitialized, {
+          runtimeEntityId: this.runtimeEntityId,
+        });
+      } catch {}
+      this.startInputLoop();
+    }, 1000);
+    this.emit("spawn");
+  }
+
+  private startInputLoop() {
+    this.stopInputLoop();
+    this.inputTimer = setInterval(() => this.sendAuthInput(), 50);
+    this.inputReady = true;
+    this.emit("input_ready");
+  }
+
+  private stopInputLoop() {
+    if (this.inputTimer) {
+      clearInterval(this.inputTimer);
+      this.inputTimer = null;
+    }
+  }
+
+  /** Integrate walk + gravity. Unknown columns are NOT air — never fall into the void. */
+  private integrateMovement(dt = 0.05) {
+    if (Date.now() < this.correctionHoldUntil || Date.now() < this.allowMoveAt) {
+      this.moveVecX = 0;
+      this.moveVecZ = 0;
+      return;
+    }
+    if (!this.saneY(this.position.y)) {
+      this.recoverFromVoid("local");
+      return;
+    }
+    const world = this.opts.world;
+    const mx = this.moveVecX;
+    const mz = this.moveVecZ;
+    const moving = Math.abs(mx) > 0.001 || Math.abs(mz) > 0.001;
+    const blocksPerSec = this.controls.sneak ? 1.1 : this.controls.sprint ? 2.2 : 1.6;
+
+    if (moving) {
+      const step = blocksPerSec * dt;
+      const yaw = this.yaw * Math.PI / 180;
+      const sin = Math.sin(yaw);
+      const cos = Math.cos(yaw);
+      const nx = this.position.x + (-mz * sin + mx * cos) * step;
+      const nz = this.position.z + (mz * cos + mx * sin) * step;
+      if (!this.blocked(world, nx, this.position.y, nz)) {
+        this.position.x = nx;
+        this.position.z = nz;
+      }
+    }
+
+    const ix = Math.floor(this.position.x);
+    const iz = Math.floor(this.position.z);
+    const gy = Math.floor(this.position.y);
+    let groundY: number | null = null;
+    if (world?.getColumn(ix >> 4, iz >> 4)) {
+      for (let dy = 0; dy <= 12; dy++) {
+        if (world.isSolidAt(ix, gy - dy, iz)) {
+          groundY = gy - dy;
+          break;
+        }
+      }
+    }
+    if (groundY == null) {
+      this.onGround = true;
+      if (this.anchorValid && this.position.y < this.serverAnchor.y - 1.25) {
+        this.position.y = this.serverAnchor.y;
+      }
+    } else if (world!.isSolidAt(ix, gy, iz)) {
+      this.position.y = gy + 1;
+      this.onGround = true;
+    } else if (groundY === gy - 1) {
+      if (this.position.y > gy + 0.06) this.position.y = Math.max(gy, this.position.y - 0.22);
+      else this.position.y = gy;
+      this.onGround = this.position.y <= gy + 0.02;
+    } else if (gy - groundY <= 4) {
+      this.position.y -= Math.min(0.22, (gy - groundY) * 0.08);
+      this.onGround = false;
+    } else {
+      this.onGround = true;
+    }
+
+    if (this.controls.jump && this.onGround && Date.now() >= this.allowMoveAt) {
+      this.position.y += 0.42;
+      this.onGround = false;
+    }
+
+    if (!this.saneY(this.position.y)) {
+      this.recoverFromVoid("integrate");
+      return;
+    }
+    if (this.anchorValid && this.onGround) {
+      const drift = Math.hypot(this.position.x - this.serverAnchor.x, this.position.z - this.serverAnchor.z);
+      if (drift < 6) this.serverAnchor = { ...this.position };
+    }
+  }
+
+  private blocked(world: World | undefined, x: number, y: number, z: number): boolean {
+    if (!world) return false;
+    const ix = Math.floor(x);
+    const iz = Math.floor(z);
+    if (!world.getColumn(ix >> 4, iz >> 4)) return false;
+    const iy = Math.floor(y);
+    return world.isSolidAt(ix, iy, iz) || world.isSolidAt(ix, iy + 1, iz);
+  }
+
+  blockAt(x: number, y: number, z: number): number | null {
+    const world = this.opts.world;
+    const ix = Math.floor(x);
+    const iy = Math.floor(y);
+    const iz = Math.floor(z);
+    if (!world.getColumn(ix >> 4, iz >> 4)) return null;
+    return world.getBlock(ix, iy, iz);
+  }
+
+  private sendAuthInput() {
+    if (!this.client || !(this as any).spawned || !this.client.connected) return;
+    if (!this.saneY(this.position.y)) {
+      this.recoverFromVoid("auth");
+      return;
+    }
+    this.tick++;
+
+    this.integrateMovement(0.05);
+
+    let dx = this.position.x - this.lastPosition.x;
+    let dy = this.position.y - this.lastPosition.y;
+    let dz = this.position.z - this.lastPosition.z;
+    const clamp = (v: number, m = 0.42) => Math.max(-m, Math.min(m, v));
+    dx = clamp(dx); dy = clamp(dy); dz = clamp(dz);
+    const delta = { x: dx, y: dy, z: dz };
+
+    // VerticalCollision only while actually supported. Claiming it in the air
+    // made the dedicated server keep a falling body instead of killing/respawning it.
+    let flags = this.onGround ? (1n << 50n) : 0n;
+    if (this.controls.forward && !this.controls.left && !this.controls.right) flags |= 1n << 10n;
+    if (this.controls.back && !this.controls.left && !this.controls.right) flags |= 1n << 11n;
+    if (this.controls.left && !this.controls.forward && !this.controls.back) flags |= 1n << 12n;
+    if (this.controls.right && !this.controls.forward && !this.controls.back) flags |= 1n << 13n;
+    if (this.controls.forward && this.controls.left) flags |= 1n << 14n;
+    if (this.controls.forward && this.controls.right) flags |= 1n << 15n;
+    if (this.controls.sprint) flags |= (1n << 20n) | (1n << 4n);
+    if (this.controls.jump) flags |= 1n << 21n;
+
+
+    try {
+    this.client.send(PacketId.PlayerAuthInput, {
+      pitch: this.pitch,
+      yaw: this.yaw,
+      headYaw: this.yaw,
+      position: { x: this.position.x, y: this.position.y, z: this.position.z },
+      moveVecX: this.moveVecX,
+      moveVecZ: this.moveVecZ,
+      inputData: flags,
+      inputMode: InputMode.Mouse,
+      playMode: PlayMode.Normal,
+      interactionModel: InteractionModel.Classic,
+      interactPitch: this.pitch,
+      interactYaw: this.yaw,
+      tick: this.tick,
+      delta,
+      analogueMoveX: this.moveVecX,
+      analogueMoveZ: this.moveVecZ,
+      rawMoveX: this.moveVecX,
+      rawMoveZ: this.moveVecZ,
+      cameraOrientation: {
+        x: -Math.cos(this.pitch) * Math.sin(this.yaw),
+        y: -Math.sin(this.pitch),
+        z: Math.cos(this.pitch) * Math.cos(this.yaw),
+      },
+    });
+    this.lastPosition = { x: this.position.x, y: this.position.y, z: this.position.z };
+    this.prevControls = { ...this.controls };
+    } catch (e) {
+      // connection may have closed
+    }
+  }
+
+  setMovement(moveX: number, moveZ: number, flags: number | bigint = 0n) {
+    this.moveVecX = moveX;
+    this.moveVecZ = moveZ;
+    this.inputFlags = typeof flags === "bigint" ? flags : BigInt(flags >>> 0);
+  }
+
+  setControls(controls: MovementControls) {
+    if (!this.spawned || Date.now() < this.allowMoveAt || Date.now() < this.correctionHoldUntil) {
+      this.controls = {};
+      this.moveVecX = 0;
+      this.moveVecZ = 0;
+      return;
+    }
+    this.controls = { ...controls };
+    const vec = moveVectorFromControls(controls);
+    this.moveVecX = vec.x;
+    this.moveVecZ = vec.z;
+    this.inputFlags = flagsFromControls(controls, this.prevControls);
+  }
+
+  setLook(yaw: number, pitch: number) {
+    this.yaw = yaw;
+    this.pitch = pitch;
+  }
+
+  setPosition(pos: Vec3) {
+    if (!Number.isFinite(pos.x) || !Number.isFinite(pos.y) || !Number.isFinite(pos.z)) return;
+    if (!this.saneY(pos.y)) return;
+    this.position = { ...pos };
+    this.lastPosition = { ...this.position };
+  }
+
+  digStart(pos: Vec3, face = 1) {
+    this.client.send(PacketId.PlayerAction, {
+      runtimeEntityId: this.runtimeEntityId,
+      action: 0,
+      position: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
+      face,
+    });
+  }
+
+  digAbort(pos: Vec3) {
+    this.client.send(PacketId.PlayerAction, {
+      runtimeEntityId: this.runtimeEntityId,
+      action: 2,
+      position: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
+      face: 0,
+    });
+  }
+
+  digFinish(pos: Vec3, face = 1) {
+    this.client.send(PacketId.PlayerAction, {
+      runtimeEntityId: this.runtimeEntityId,
+      action: 1,
+      position: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
+      face,
+    });
+  }
+
+
+  digStop(pos: { x: number; y: number; z: number }, face = 1) {
+    this.client.send(PacketId.PlayerAction, {
+      runtimeEntityId: this.runtimeEntityId,
+      action: 2, // stop break
+      position: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
+      resultPosition: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
+      face,
+    });
+  }
+
+  selectHotbar(slot: number) {
+    this.hotbarSlot = Math.max(0, Math.min(8, slot | 0));
+    const item = this.opts.inventory?.getSlot(this.hotbarSlot);
+    try {
+      this.client.send(PacketId.MobEquipment, {
+        runtimeEntityId: this.runtimeEntityId,
+        item: { networkId: item?.networkId ?? 0, count: item?.count ?? 1 },
+        slot: this.hotbarSlot,
+        selectedSlot: this.hotbarSlot,
+        windowId: 0,
+      });
+    } catch {}
+  }
+
+  getHealth() { return this.health; }
+  getHotbarSlot() { return this.hotbarSlot; }
+  isConnected() { return !!(this.client && this.spawned); }
+
+  placeBlock(blockPos: Vec3, face = 1, heldNetworkId = 0) {
+    if (!this.spawned || !this.client.connected || Date.now() < this.allowMoveAt) return false;
+    if (!this.saneY(this.position.y) || !this.saneY(blockPos.y)) return false;
+    const held = this.heldItem();
+    const networkId = held?.networkId || heldNetworkId;
+    if (!networkId) {
+      console.log("[BDSSession] place skipped — empty hand");
+      return false;
+    }
+    const body = encodeInventoryTransaction({
+      transactionType: InventoryTransactionType.UseItem,
+      actions: [],
+      actionType: 0,
+      blockPos: {
+        x: Math.floor(blockPos.x),
+        y: Math.floor(blockPos.y),
+        z: Math.floor(blockPos.z),
+      },
+      face,
+      hotbarSlot: this.hotbarSlot,
+      itemInHand: { networkId, count: held?.count || 1, metadata: held?.metadata },
+      playerPos: this.position,
+      clickPos: {
+        x: Math.floor(blockPos.x) + 0.5,
+        y: Math.floor(blockPos.y) + 0.5,
+        z: Math.floor(blockPos.z) + 0.5,
+      },
+    });
+    this.client.sendRaw(encodeGamePacket(PacketId.InventoryTransaction, { raw: body }));
+    return true;
+  }
+
+  private heldItem(): { networkId: number; count: number; metadata?: number } | null {
+    const inv = this.opts.inventory;
+    const direct = inv?.getSlot(this.hotbarSlot);
+    if (direct?.networkId) return direct;
+    for (let s = 0; s < 9; s++) {
+      const it = inv?.getSlot(s);
+      if (it?.networkId) {
+        this.hotbarSlot = s;
+        try { this.selectHotbar(s); } catch { /* */ }
+        return it;
+      }
+    }
+    return null;
+  }
+
+  attackEntity(targetRuntimeId: number) {
+    const pkt = buildAttackEntityPacket({
+      entityRuntimeId: BigInt(targetRuntimeId),
+      hotbarSlot: 0,
+      playerPos: this.position,
+    });
+    this.client.sendRaw(encodeGamePacket(pkt.id, { raw: pkt.payload }));
+    this.client.send(PacketId.Animate, {
+      actionId: 1,
+      runtimeEntityId: this.runtimeEntityId,
+    });
+  }
+
+  /**
+   * Activate / consume held item (food, potion, etc.) via InventoryTransaction UseItem (click air).
+   */
+  useItem(opts: {
+    hotbarSlot?: number;
+    itemInHand: ItemStack;
+    releaseAfterMs?: number;
+  }) {
+    const slot = opts.hotbarSlot ?? 0;
+    const pkt = buildUseItemPacket({
+      hotbarSlot: slot,
+      itemInHand: opts.itemInHand,
+      playerPos: this.position,
+    });
+    this.client.sendRaw(encodeGamePacket(pkt.id, { raw: pkt.payload }));
+
+    // Many consumables also need ReleaseItem after hold duration
+    const releaseMs = opts.releaseAfterMs ?? 1600;
+    if (releaseMs > 0) {
+      setTimeout(() => {
+        try {
+          const rel = buildReleaseItemPacket({
+            hotbarSlot: slot,
+            itemInHand: opts.itemInHand,
+            playerPos: this.position,
+          });
+          this.client.sendRaw(encodeGamePacket(rel.id, { raw: rel.payload }));
+        } catch { /* session may be gone */ }
+      }, releaseMs);
+    }
+  }
+
+  /** Immediate release of charged / consuming item */
+  releaseItem(itemInHand: ItemStack, hotbarSlot = 0) {
+    const rel = buildReleaseItemPacket({
+      hotbarSlot,
+      itemInHand,
+      playerPos: this.position,
+    });
+    this.client.sendRaw(encodeGamePacket(rel.id, { raw: rel.payload }));
+  }
+
+  chat(message: string) {
+    this.client.send(PacketId.Text, {
+      type: 1,
+      needsTranslation: false,
+      message: message || " ",
+      sourceName: this.opts.username ?? "",
+      xuid: (this as any).authResult?.xuid ?? "",
+      platformChatId: "",
+    });
+  }
+
+  /** Send ItemStackRequest for live inventory ops */
+  sendItemStackRequest(actions: Parameters<typeof encodeItemStackRequest>[0]["actions"]) {
+    const pkt = encodeItemStackRequest({ actions });
+    this.client.sendRaw(encodeGamePacket(pkt.id, { raw: pkt.payload }));
+    return pkt.requestId;
+  }
+
+  transferSlots(fromContainer: number, fromSlot: number, toContainer: number, toSlot: number, count: number) {
+    const pkt = buildTransferRequest(
+      { containerId: fromContainer, slot: fromSlot },
+      { containerId: toContainer, slot: toSlot },
+      count
+    );
+    this.client.sendRaw(encodeGamePacket(pkt.id, { raw: pkt.payload }));
+    return pkt.requestId;
+  }
+
+  /** Notify server of hotbar selection / held item */
+  sendMobEquipment(hotbarSlot: number, item: { networkId: number; count: number }) {
+    this.client.send(PacketId.MobEquipment, {
+      runtimeEntityId: this.runtimeEntityId,
+      item,
+      slot: hotbarSlot,
+      selectedSlot: hotbarSlot,
+      windowId: 0,
+    });
+  }
+
+  closeContainer(windowId: number) {
+    this.client.send(PacketId.ContainerClose, { windowId, server: false });
+  }
+
+  dispose() {
+    this.stopInputLoop();
+    if (this.subChunkRetryTimer) {
+      clearInterval(this.subChunkRetryTimer);
+      this.subChunkRetryTimer = null;
+    }
+  }
+}

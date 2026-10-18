@@ -1,0 +1,59 @@
+Connecting...
+[Auth] Microsoft → Xbox Live → XSTS → Minecraft Services → JWT chain
+[Auth] Using cached refresh token
+[Auth] Token cache saved → /home/ubuntu/.openclaw/workspace/.aether-auth/msa-VikramDon9580.json
+[Auth] Bedrock chain length=2
+[Auth] Multiplayer token len=1076
+[Auth] Online OK as VikramDon9580 xuid=2535437847607862 chain=3
+[Aether v1.11.0-alpha] VikramDon9580 → lotus.taspmail.online:19132
+[Aether] auth=microsoft transport=nethernet protocol=2193
+[NetherNet] GET http://lotus.taspmail.online:19132/v1/join
+[NetherNet] Probe OK networkId=1 protocol=2193
+[WebRTC] Using werift
+[NetherNet] iceConnectionState= completed
+[NetherNet] POST http://lotus.taspmail.online:19132/v1/join/1 (candidates=2, sdp=2465b)
+[NetherNet] Answer carries a=identity assertion
+[NetherNet] iceConnectionState= checking
+[NetherNet] iceConnectionState= connected
+[NetherNet] WebRTC data channel OPEN — live path (1065ms)
+LOGGED_IN
+[BDSSession] RequestNetworkSettings protocol=2193
+[BDSSession] NetworkSettings {
+  compressionThreshold: 1,
+  compressionAlgorithm: 0,
+  clientThrottle: 0,
+  clientThrottleThreshold: 0,
+  clientThrottleScalar: 0,
+}
+[BDSSession] Login chain=3 user=VikramDon9580 offline=false hasKey=true
+[Login] authInfoLen=3669 clientJwtLen=30907 authHead={"Certificate":"{\"chain\":[\"eyJhbGciOiJFUzM4NCIsIng1dSI6Ik1IWXdFQVlIS29aSXpqMENBUVlGSzRFRUFDSURZZ0FFdWl1THVhNGdoSC9SN3
+[BDSSession] abilities invuln= false
+[BDSSession] abilities invuln= false
+[BDSSession] abilities invuln= false
+[BDSSession] abilities invuln= false
+[BDSSession] health= 34
+[BDSSession] SPAWN init runtimeId=33079 pos= {
+  x: 82.23041534423828,
+  y: 65.62001037597656,
+  z: -95.22492218017578,
+}
+[Aether AI] Human + agent + decision starting
+[Human] Behavior started style=friendly curiosity=0.55
+[Survival] Module started
+[Decision] Engine started
+[Decision] mode=autonomous {}
+[Agent] Control loop started
+BOT_SPAWNED
+[CHAT] VikramDon9580§r: Aether Bot Online. I am coming to x:40 y:77 z:20 to meet Adarshkumar1783.
+[CHAT] VikramDon9580§r: hmm
+[Explore] → 81, 66, -43
+[LLM] OpenAI-compat failed (429), trying Gemini native...
+[LLM] OpenAI-compat failed (429), trying Gemini native...
+[LLMPlanner] Gemini HTTP 429: {
+  "error": {
+    "code": 429,
+    "message": "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20,
+[ChatBrain] Gemini HTTP 429: {
+  "error": {
+    "code": 429,
+    "message": "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20,

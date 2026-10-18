@@ -1,0 +1,5 @@
+Starting Aether Engine V6...
+[Auth] Microsoft → Xbox Live → XSTS → Minecraft Services → JWT chain
+[Auth] Using cached refresh token
+[Auth] Token cache saved → /home/ubuntu/.openclaw/workspace/.aether-auth/msa-VikramDon9580.json
+[Auth] Bedrock chain length=2

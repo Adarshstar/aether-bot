@@ -1,0 +1,266 @@
+/**
+ * Aether v1.11 — full play loop on Lotus SMP (BDS 1.26.52.3 :19132)
+ * Join → settle → explore → dig → place → occasional chat
+ */
+import { createBot, resolvePeerConnectionFactory, LLMClient } from "../index";
+import { writeFileSync, unlinkSync, existsSync, readFileSync } from "node:fs";
+
+const LOCK = "/tmp/aether-bot.lock";
+const host = process.env.MC_HOST ?? "13.126.209.44";
+const port = Number(process.env.MC_PORT ?? 19132);
+const apiKey = process.env.GEMINI_API_KEY ?? process.env.AI_API_KEY ?? "";
+
+function acquireLock(): void {
+  if (existsSync(LOCK)) {
+    try {
+      const pid = Number(readFileSync(LOCK, "utf8"));
+      try {
+        process.kill(pid, 0);
+        console.error("[full] Another bot instance running pid=" + pid);
+        process.exit(1);
+      } catch {
+        /* stale */
+      }
+    } catch {}
+  }
+  writeFileSync(LOCK, String(process.pid));
+  process.on("exit", () => {
+    try {
+      unlinkSync(LOCK);
+    } catch {}
+  });
+}
+acquireLock();
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const t0 = Date.now();
+let generation = 0;
+let loopRunning = false;
+let busy = false;
+let taskMemory = "settle, then explore and build a small shelter";
+let lastGemini = 0;
+const GEMINI_MIN_MS = 45000;
+let phase: "explore" | "build" | "grind" | "rest" = "explore";
+let phaseLeft = 2;
+let heading = 0;
+
+let llm: LLMClient | null = null;
+
+async function main() {
+  if (apiKey) {
+    llm = new LLMClient({
+      apiKey,
+      provider: "gemini",
+      model: process.env.GEMINI_MODEL ?? "gemini-3.8-flash",
+      temperature: 0.4,
+      maxTokens: 120,
+    });
+    console.log("[full] Gemini ready (chat only, slow)");
+  }
+
+  const factory = await resolvePeerConnectionFactory();
+  if (!factory) {
+    console.error("[full] No WebRTC");
+    process.exit(1);
+  }
+
+  const bot = createBot({
+    host,
+    port,
+    username: "AetherBot",
+    offline: false,
+    auth: "microsoft",
+    strictWebRTC: true,
+    createPeerConnection: factory,
+    networkId: process.env.MC_NETWORK_ID || "1",
+    signalingTimeoutMs: 25000,
+    iceGatherTimeoutMs: 10000,
+    maxRetries: 3,
+    autoReconnect: true,
+    reconnectBaseMs: 20000,
+    maxReconnectAttempts: 12,
+  } as any);
+
+  bot.on("spawn", () => {
+    const gen = ++generation;
+    console.log("[full] SPAWN gen=" + gen + " " + (Date.now() - t0) + "ms");
+    if (!loopRunning) {
+      loopRunning = true;
+      void loop(bot);
+    }
+  });
+
+  bot.on("chat", async (user: any, msg: any) => {
+    const name = String(user ?? "");
+    const text = String(msg ?? "");
+    if (!text) return;
+    console.log("[full] <" + name + "> " + text);
+    if (!llm) return;
+    if (name.includes("VikramDon") || name.includes("Aether")) return;
+    if (Date.now() - lastGemini < GEMINI_MIN_MS) return;
+    if (!alive(bot)) return;
+    lastGemini = Date.now();
+    try {
+      const reply = await llm.complete(
+        "You are Aether, a Minecraft Bedrock player on Lotus SMP. Task: " +
+          taskMemory +
+          ". Reply in one short sentence. No markdown.",
+        name + ": " + text
+      );
+      if (reply && alive(bot)) bot.chat(reply.replace(/\n+/g, " ").slice(0, 140));
+    } catch (e: any) {
+      console.error("[full] Gemini", e?.message || e);
+    }
+  });
+
+  bot.on("hurt", async () => {
+    console.log("[full] hurt — step back");
+    if (!alive(bot)) return;
+    try {
+      await setControls(bot, { back: true });
+      await sleep(500);
+      await setControls(bot, {});
+    } catch {}
+  });
+
+  bot.on("error", (e: any) => console.error("[full] error", e?.message || e));
+  bot.on("disconnect", (r: any) => {
+    generation++;
+    console.log("[full] disconnect gen=" + generation, r);
+    try { setControls(bot, {}); } catch {}
+  });
+
+  console.log("[full] connecting " + host + ":" + port + " protocol target 1.26.52.3");
+  await bot.connect();
+}
+
+function alive(bot: any) {
+  return !!bot?.session?.isSpawned && bot.connected !== false;
+}
+
+function ready(bot: any) {
+  return alive(bot) && !!bot.session?.readyForPlay;
+}
+
+async function setControls(bot: any, c: Record<string, boolean>) {
+  try {
+    if (bot.session?.setControls) bot.session.setControls(c);
+    else if (bot.setControls) bot.setControls(c);
+  } catch {}
+}
+
+async function walk(bot: any, ms: number, c: Record<string, boolean>) {
+  const gen = generation;
+  if (!ready(bot)) return;
+  await setControls(bot, c);
+  const step = 100;
+  for (let t = 0; t < ms; t += step) {
+    if (generation !== gen || !ready(bot)) break;
+    await sleep(step);
+  }
+  await setControls(bot, {});
+  await sleep(120);
+}
+
+function pos(bot: any) {
+  const p = bot.session?.pos ?? bot.entity?.position ?? { x: 0, y: 64, z: 0 };
+  return { x: p.x, y: p.y, z: p.z };
+}
+
+async function tryPlace(bot: any, x: number, y: number, z: number) {
+  if (!ready(bot)) return false;
+  try {
+    if (bot.session?.placeBlock) return !!bot.session.placeBlock({ x, y, z }, 1, 0);
+  } catch (e: any) {
+    console.error("[full] place", e?.message || e);
+  }
+  return false;
+}
+
+async function tryDig(bot: any, x: number, y: number, z: number) {
+  if (!ready(bot)) return;
+  const id = bot.session?.blockAt?.(x, y, z);
+  if (id === null || id === 0) return;
+  try {
+    if (bot.session?.digStart) bot.session.digStart({ x, y, z }, 1);
+    await sleep(700);
+    if (generation && bot.session?.digStop) bot.session.digStop({ x, y, z }, 1);
+  } catch {}
+}
+
+function nextPhase(): "explore" | "build" | "grind" | "rest" {
+  if (phaseLeft > 0) {
+    phaseLeft--;
+    return phase;
+  }
+  const order: Array<"explore" | "grind" | "build" | "rest"> = ["explore", "grind", "build", "rest"];
+  const i = order.indexOf(phase);
+  phase = order[(i + 1) % order.length];
+  phaseLeft = phase === "rest" ? 0 : 2;
+  return phase;
+}
+
+async function loop(bot: any) {
+  while (true) {
+    if (!ready(bot)) {
+      await sleep(1000);
+      continue;
+    }
+    if (busy) {
+      await sleep(500);
+      continue;
+    }
+    busy = true;
+    const gen = generation;
+    try {
+      const action = nextPhase();
+      const p = pos(bot);
+      taskMemory = action + " at " + Math.floor(p.x) + "," + Math.floor(p.y) + "," + Math.floor(p.z);
+      console.log("[full] action=" + action + " " + taskMemory);
+
+      if (action === "rest") {
+        await sleep(8000);
+      } else if (action === "grind") {
+        for (let i = 0; i < 2 && generation === gen && ready(bot); i++) {
+          await walk(bot, 700, { forward: true });
+          const here = pos(bot);
+          await tryDig(bot, here.x, here.y - 1, here.z);
+          heading += 0.6;
+          try { bot.session?.setLook?.(heading, 0); } catch {}
+        }
+      } else if (action === "build") {
+        const base = pos(bot);
+        const bx = Math.floor(base.x);
+        const by = Math.floor(base.y);
+        const bz = Math.floor(base.z);
+        let placed = 0;
+        const spots = [
+          [1, 0, 0], [2, 0, 0], [2, 0, 1], [2, 0, 2],
+          [1, 0, 2], [0, 0, 2], [0, 0, 1],
+          [1, 1, 0], [2, 1, 0], [2, 1, 2], [0, 1, 2],
+        ];
+        for (const [dx, dy, dz] of spots) {
+          if (generation !== gen || !ready(bot)) break;
+          if (await tryPlace(bot, bx + dx, by + dy, bz + dz)) placed++;
+          await sleep(350);
+        }
+        console.log("[full] placed " + placed);
+      } else {
+        for (let i = 0; i < 3 && generation === gen && ready(bot); i++) {
+          await walk(bot, 800, { forward: true });
+          heading += 0.8;
+          try { bot.session?.setLook?.(heading, 0); } catch {}
+        }
+      }
+    } catch (e: any) {
+      console.error("[full] loop", e?.message || e);
+    }
+    busy = false;
+    await sleep(2000);
+  }
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Bun ${{ matrix.bun }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bun: ["1.1.38", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-shi/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun }}
+
+      - name: Install
+        run: bun install --no-save
+
+      - name: Unit tests
+        run: bun test
+
+      - name: Pathfinder bench
+        run: bun test tests/pathfinder-bench.test.ts
+
+      - name: Join validation (mock)
+        run: bun run examples/live-join-validate.ts
+        env:
+          STRICT_WEBRTC: "0"
+
+  build:
+    name: Build & architecture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-shi/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Public API bundle
+        run: bun build index.ts --target=bun --outdir=/tmp/aether-ci-build
+
+      - name: Layer boundaries
+        run: |
+          set -e
+          if grep -R "from \"../ai/" src/core/ 2>/dev/null; then
+            echo "FAIL: core must not import ai"; exit 1
+          fi
+          if grep -R "from \"../script/" src/protocol/ 2>/dev/null; then
+            echo "FAIL: protocol must not import script"; exit 1
+          fi
+          if grep -R "from \"../human/" src/protocol/ 2>/dev/null; then
+            echo "FAIL: protocol must not import human"; exit 1
+          fi
+          echo "Layer boundary checks OK"
+
+      - name: Version consistency
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          grep -q "$PKG" src/core/version.ts
+          echo "version OK: $PKG"
+
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-shi/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --no-save
+      - run: bunx tsc --noEmit

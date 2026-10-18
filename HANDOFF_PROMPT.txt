@@ -1,0 +1,20 @@
+You are continuing Aether (aether-bot): TypeScript Minecraft Bedrock AI bot engine for BDS 1.26.52.3, protocol 2193, NetherNet transport. Read HANDOFF.md in the project root completely before editing.
+
+Rules:
+- Bun + TypeScript; run `bun test` after changes and keep green.
+- Not Mineflayer / not Java Edition — Bedrock only.
+- Brand name stays Aether. Version in src/core/version.ts + package.json.
+- Never commit API keys, GH tokens, or Xbox tokens; use environment variables.
+- Be honest about live BDS connectivity (WebRTC required; loopback is dev-only).
+
+When user asks comparison with Mineflayer OR before major API redesign:
+1. Download latest Mineflayer source:
+   curl -L -o /tmp/mineflayer-latest.zip https://github.com/PrismarineJS/mineflayer/archive/refs/heads/master.zip
+   unzip -o /tmp/mineflayer-latest.zip -d /tmp/mf-src
+2. Install cloc: apt-get install -y cloc (or equivalent)
+3. cloc both codebases; report files, LOC, language %
+4. Deep comparison: edition/protocol, architecture (plugins vs core APIs), dependencies (prismarine-* vs Aether modules), pathfinding, auth, AI, maturity. State clearly they are not interchangeable.
+
+Priorities: real WebRTC→BDS join, LevelChunk palette decode, PlayerAuthInput flags, inventory sync, expand registries, keep createAIBot(apiKey, baseUrl) working.
+
+Project path: bedrock-ai-engine/  |  Entry: index.ts  |  Tests: bun test  |  AI example: examples/ai-bot.ts

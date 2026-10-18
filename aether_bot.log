@@ -1,0 +1,101 @@
+397 |   });
+         ^
+error: Expected identifier but found ")"
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:397:4
+
+399 |   this.client.onPacket(PacketId.CorrectPlayerMovePrediction, (data) => {
+            ^
+error: Expected ";" but found "."
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:399:7
+
+399 |   this.client.onPacket(PacketId.CorrectPlayerMovePrediction, (data) => {
+                   ^
+error: Expected ";" but found "."
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:399:14
+
+399 |   this.client.onPacket(PacketId.CorrectPlayerMovePrediction, (data) => {
+                                     ^
+error: Expected ")" but found "."
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:399:32
+
+399 |   this.client.onPacket(PacketId.CorrectPlayerMovePrediction, (data) => {
+                                      ^
+error: Expected ";" but found "CorrectPlayerMovePrediction"
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:399:33
+
+399 |   this.client.onPacket(PacketId.CorrectPlayerMovePrediction, (data) => {
+                                                                 ^
+error: Expected identifier but found ","
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:399:60
+
+399 |   this.client.onPacket(PacketId.CorrectPlayerMovePrediction, (data) => {
+                                                                    ^
+error: Expected ";" but found "data"
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:399:63
+
+399 |   this.client.onPacket(PacketId.CorrectPlayerMovePrediction, (data) => {
+                                                                        ^
+error: Expected identifier but found ")"
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:399:67
+
+399 |   this.client.onPacket(PacketId.CorrectPlayerMovePrediction, (data) => {
+                                                                             ^
+error: Expected ";" but found "{"
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:399:72
+
+400 |     if (data.position) {
+                  ^
+error: Expected ")" but found "."
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:400:13
+
+400 |     if (data.position) {
+                   ^
+error: Expected ";" but found "position"
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:400:14
+
+400 |     if (data.position) {
+                           ^
+error: Expected identifier but found ")"
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:400:22
+
+401 |       this.position = { ...data.position };
+                ^
+error: Expected ";" but found "."
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:401:11
+
+402 |       this.lastPosition = { ...this.position };
+                ^
+error: Expected ";" but found "."
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:402:11
+
+403 |       console.log("[BDSSession] Server corrected position:", this.position);
+                   ^
+error: Expected ";" but found "."
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:403:14
+
+403 |       console.log("[BDSSession] Server corrected position:", this.position);
+                        ^
+error: Expected identifier but found ""[BDSSession] Server corrected position:""
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:403:19
+
+403 |       console.log("[BDSSession] Server corrected position:", this.position);
+                                                                       ^
+error: Expected ")" but found "."
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:403:66
+
+403 |       console.log("[BDSSession] Server corrected position:", this.position);
+                                                                        ^
+error: Expected ";" but found "position"
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:403:67
+
+403 |       console.log("[BDSSession] Server corrected position:", this.position);
+                                                                                ^
+error: Expected identifier but found ")"
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:403:75
+
+405 |   });
+        ^
+error: Unexpected }
+    at /home/ubuntu/aether-live/src/protocol/BDSSession.ts:405:3
+
+Bun v1.4.3 (Linux arm64)

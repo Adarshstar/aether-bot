@@ -1,0 +1,49 @@
+{
+  "name": "aether-bot",
+  "version": "1.12.0-alpha",
+  "description": "Aether \u2014 Bedrock bot (BDS 1.26.52.3 / protocol 2193 / NetherNet / Gemini)",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run index.ts",
+    "dev": "bun --watch examples/full-agent.ts",
+    "example": "bun run examples/full-agent.ts",
+    "example:auth": "bun run examples/microsoft-login.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "handoff": "echo See HANDOFF.md and HANDOFF_PROMPT.txt",
+    "validate:join": "bun run examples/live-join-validate.ts",
+    "bench:path": "bun test tests/pathfinder-bench.test.ts",
+    "join:fast": "bun run examples/join-fast.ts",
+    "example:custom": "bun run examples/custom-work.ts",
+    "ci": "bun test && bun build index.ts --target=bun --outdir=/tmp/aether-ci-build",
+    "task:house": "bun run examples/grind-and-house.ts",
+    "play": "bun run examples/play-full.ts",
+    "play:lotus": "bun run examples/play-full.ts"
+  },
+  "keywords": [
+    "aether",
+    "minecraft",
+    "bedrock",
+    "bds",
+    "bot",
+    "ai",
+    "nethernet",
+    "protocol-2193",
+    "pathfinder",
+    "agent"
+  ],
+  "license": "MIT",
+  "engines": {
+    "bun": ">=1.0.0",
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "werift": "^0.25.0"
+  }
+}
