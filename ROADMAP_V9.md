@@ -47,7 +47,7 @@ Goal: Bot operates unattended for hours, builds/defends a base, coordinates with
 - [x] **Economy/Trading**: `src/mastery/Economy.ts` — villager trade optimization, price tracking, deficit tracking, recommended trades
 - [x] **Integration**: Wired into `AIBot.ts` (`bot.threatMap`, `bot.veinTracker`, `bot.farmSuite`, `bot.economy`)
 - [ ] **Live validation**: Test against Lotus server (lotus.taspmail.online:19132)
-- [ ] **HTN planner integration**: Wire threat/vein/farm data into HTN plan preconditions
+- [x] **HTN planner integration**: ThreatMap and VeinTracker wired into HTN planner preconditions — `safeToMine`/`safeToBuild` block digging/building in dangerous areas; `mine_iron` uses VeinTracker for best known vein; threat-aware replanning via `ensure_survival`
 
 ## Phase 5 — ⚡ Performance & Scale
 - [ ] **Chunk Streaming**: Load/unload columns dynamically by distance, persist dirty sections to disk

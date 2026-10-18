@@ -10,6 +10,8 @@ import type { Bot } from "../core/Bot";
 import type { AgentAction, AgentObservation } from "../ai/Agent";
 import type { Goal } from "../pathfinding/Pathfinder";
 import { distance } from "../types";
+import type { ThreatQuery } from "../mastery/ThreatMap";
+import type { VeinRecord } from "../mastery/VeinTracker";
 
 /** Primitive action the bot can execute (maps 1:1 to AgentAction) */
 export interface PrimitiveAction {
@@ -55,7 +57,11 @@ export class HTNPlanner {
   private primitives = new Map<string, PrimitiveAction>();
   private compounds = new Map<string, CompoundTask>();
 
-  constructor(private bot: Bot) {
+  constructor(
+    private bot: Bot,
+    private threatMap?: import("../mastery/ThreatMap").ThreatMap,
+    private veinTracker?: import("../mastery/VeinTracker").VeinTracker,
+  ) {
     this.registerPrimitives();
     this.registerCompounds();
   }
@@ -70,7 +76,6 @@ export class HTNPlanner {
       effects: [{ key: "atTarget", value: true }],
       cost: 10,
     });
-
     this.addPrimitive({
       name: "look_at",
       action: { type: "look_at", position: { x: 0, y: 0, z: 0 } },
@@ -96,6 +101,7 @@ export class HTNPlanner {
         { key: "hasTool", value: true },
         { key: "blockInReach", value: true },
         { key: "targetBlockExists", value: true },
+        { key: "safeToMine", value: true },
       ],
       effects: [{ key: "blockMined", value: true }, { key: "hasResources", value: true }],
       cost: 20,
@@ -108,6 +114,7 @@ export class HTNPlanner {
       preconditions: [
         { key: "hasBlock", value: true },
         { key: "canReachPosition", value: true },
+        { key: "safeToBuild", value: true },
       ],
       effects: [{ key: "blockPlaced", value: true }],
       cost: 10,
@@ -173,12 +180,19 @@ export class HTNPlanner {
       ],
     });
 
-    // MINE IRON
+    // MINE IRON — uses VeinTracker to find best known vein
     this.addCompound({
       name: "mine_iron",
       subtasks: [
         this.createPrimitiveRef("move_to", { goal: { type: "near", x: 0, y: 0, z: 0, range: 3 } }),
         this.createPrimitiveRef("dig", { x: 0, y: 0, z: 0 }), // iron ore
+      ],
+      alternatives: [
+        // Alternative: if no vein known, explore to find one
+        [
+          this.createPrimitiveRef("move_to", { goal: { type: "near", x: 0, y: 0, z: 0, range: 8 } }),
+          this.createPrimitiveRef("wait", { ms: 1000 }),
+        ],
       ],
     });
 
@@ -263,6 +277,34 @@ export class HTNPlanner {
     predicates.set("blockInReach", false); // would need raycast
     predicates.set("targetBlockExists", false);
     predicates.set("canReachPosition", true);
+
+    // Threat awareness from Phase 4 ThreatMap
+    if (this.threatMap && obs.position) {
+      const threat = this.threatMap.query(obs.position, 24);
+      predicates.set("threatIntensity", threat.intensity);
+      predicates.set("threatCount", threat.count);
+      predicates.set("dominantThreat", threat.dominantType ?? "none");
+      predicates.set("maxThreatSeverity", threat.maxSeverity);
+      predicates.set("safeToMine", threat.intensity < 0.4 && threat.dominantType !== "hostile_mob");
+      predicates.set("safeToBuild", threat.intensity < 0.3);
+    } else {
+      predicates.set("threatIntensity", 0);
+      predicates.set("threatCount", 0);
+      predicates.set("dominantThreat", "none");
+      predicates.set("maxThreatSeverity", 0);
+      predicates.set("safeToMine", true);
+      predicates.set("safeToBuild", true);
+    }
+
+    // Best vein of type from Phase 4 VeinTracker (for resource goals)
+    if (this.veinTracker && obs.position) {
+      const ironVein = this.veinTracker.bestOfType("iron", 64);
+      predicates.set("hasKnownIronVein", !!ironVein);
+      if (ironVein) {
+        predicates.set("bestIronVeinYield", ironVein.yield);
+        predicates.set("bestIronVeinDist", distance(obs.position, ironVein.pos));
+      }
+    }
 
     return { predicates, observation: obs };
   }
@@ -389,6 +431,10 @@ export class HTNPlanner {
         case "hasTool": subGoal = "craft_pickaxe"; break;
         case "hasBlock": subGoal = "gather_blocks"; break;
         case "targetInRange": subGoal = "move_to_target"; break;
+        case "safeToMine":
+        case "safeToBuild":
+          // If area is too dangerous, move to a safer position first
+          subGoal = "ensure_survival"; break;
       }
 
       if (subGoal) {
@@ -408,5 +454,7 @@ export class HTNPlanner {
 }
 
 export function createHTNPlanner(bot: Bot) {
-  return new HTNPlanner(bot);
+  const tm = (bot as any).threatMap;
+  const vt = (bot as any).veinTracker;
+  return new HTNPlanner(bot, tm, vt);
 }
