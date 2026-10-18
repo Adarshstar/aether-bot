@@ -40,11 +40,14 @@ Goal: Bot operates unattended for hours, builds/defends a base, coordinates with
 - [ ] **Formation Movement**: Guard escort, patrol routes, fleet pathfinding for 2-5 bots
 - [ ] **Player Command Bus**: Discord/Chat commands dispatch to specific bot or squad (`!squad1 guard me`)
 
-## Phase 4 — 🌍 World Mastery Systems
-- [ ] **Dynamic Threat Map**: Heatmap of hostile spawns, player PvP zones, environmental hazards (lava, void)
-- [ ] **Resource Vein Tracking**: Persistent memory of ore locations, farm yields, chest inventories across sessions
-- [ ] **Automated Farming Suite**: Crop rotation, animal breeding, villager trading hall, iron/gold farm maintenance
-- [ ] **Economy/Trading**: Villager trade optimization, auto-sell/buy based on resource deficits
+## Phase 4 — 🌍 World Mastery Systems (Priority: NOW — DELIVERED)
+- [x] **Dynamic Threat Map**: `src/mastery/ThreatMap.ts` — heatmap of hostile spawns, PvP zones, lava/void hazards with decay
+- [x] **Resource Vein Tracking**: `src/mastery/VeinTracker.ts` — persistent ore/farm/chest memory across sessions (`.aether-memory/veins.json`)
+- [x] **Automated Farming Suite**: `src/mastery/FarmSuite.ts` — crop plots, animal pens, villager traders with auto-harvest/breed
+- [x] **Economy/Trading**: `src/mastery/Economy.ts` — villager trade optimization, price tracking, deficit tracking, recommended trades
+- [x] **Integration**: Wired into `AIBot.ts` (`bot.threatMap`, `bot.veinTracker`, `bot.farmSuite`, `bot.economy`)
+- [ ] **Live validation**: Test against Lotus server (lotus.taspmail.online:19132)
+- [ ] **HTN planner integration**: Wire threat/vein/farm data into HTN plan preconditions
 
 ## Phase 5 — ⚡ Performance & Scale
 - [ ] **Chunk Streaming**: Load/unload columns dynamically by distance, persist dirty sections to disk

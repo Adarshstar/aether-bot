@@ -21,6 +21,10 @@ import { createHTNPlanner, type HTNPlanner } from "../planning/HTNPlanner";
 import { createWorldModel, type WorldModel } from "../planning/WorldModel";
 import { createBuildPlanner, type BuildPlanner } from "../construction/BuildPlanner";
 import { createSquadManager, type SquadManager } from "../squad/SquadManager";
+import { createThreatMap, type ThreatMap } from "../mastery/ThreatMap";
+import { createVeinTracker, type VeinTracker } from "../mastery/VeinTracker";
+import { createFarmSuite, type FarmSuite } from "../mastery/FarmSuite";
+import { createEconomy, type Economy } from "../mastery/Economy";
 import {
   createHumanBehavior,
   type HumanBehavior,
@@ -90,6 +94,14 @@ export interface AIBot extends Bot {
   buildPlanner: BuildPlanner;
   /** V9: squad manager for multi-bot coordination */
   squadManager: SquadManager;
+  /** V9 Phase 4: dynamic threat heatmap */
+  threatMap: ThreatMap;
+  /** V9 Phase 4: resource vein tracker */
+  veinTracker: VeinTracker;
+  /** V9 Phase 4: automated farming suite */
+  farmSuite: FarmSuite;
+  /** V9 Phase 4: economy & trading */
+  economy: Economy;
 }
 
 export function createAIBot(options: AIBotOptions): AIBot {
@@ -174,6 +186,12 @@ export function createAIBot(options: AIBotOptions): AIBot {
   bot.squadManager = createSquadManager();
   bot.squadManager.addMember(bot, "leader");
 
+  // V9 Phase 4: World Mastery systems
+  bot.threatMap = createThreatMap();
+  bot.veinTracker = createVeinTracker({ file: ".aether-memory/veins.json" });
+  bot.farmSuite = createFarmSuite({ autoHarvest: true, autoBreed: true, autoTrade: false });
+  bot.economy = createEconomy({ autoTrade: false, emeraldReserve: 16, maxTradesPerSession: 50 });
+
   // V7 Phase 3: local health dashboard
   bot.healthDashboard =
     options.enableHealthDashboard === false
@@ -192,6 +210,11 @@ export function createAIBot(options: AIBotOptions): AIBot {
     // Still run LLM planner for richer decisions when mode is ai;
     // autonomous uses personality; also start agent for hybrid
     await bot.agent.start();
+    // Phase 4: start world mastery systems
+    bot.veinTracker.stop?.();
+    bot.farmSuite?.status?.();
+    bot.economy?.status?.();
+    console.log("[Aether AI] Phase 4 World Mastery systems ready");
   };
 
   bot.stopAI = () => {
@@ -202,6 +225,7 @@ export function createAIBot(options: AIBotOptions): AIBot {
     bot.squadManager.stop();
     bot.healthDashboard?.stop();
     bot.worldKnowledge.stop();
+    bot.veinTracker.stop();
     console.log("[Aether AI] Stopped");
   };
 
